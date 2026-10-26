@@ -1,5 +1,8 @@
 import os
 from pathlib import Path
+
+import yaml
+
 from Agent.config.config import Config
 from Agent.utils import agent_print
 
@@ -26,17 +29,50 @@ def load_environments():
     return env
 
 
-def load_skills(pwd=Config.workspace):
-    skills_description = """
-    以下是skills的名称和简要描述。
-    如果要查看详情，可以使用读工具读取具体的skills。
-    """
-    root = Path(pwd)
-    for path in root.rglob("SKILL.md"):
-        lines = path.read_text(encoding="utf-8").splitlines()[:5]
-        skills_description += f"\n文件：{path.resolve()}\n"
-        skills_description += "\n".join(lines) + "\n"
-    return skills_description
+def load_skills(pwd):
+    if not Config.skills_enabled:
+        return ""
+    root = Path(pwd).expanduser().resolve()
+    descriptions = []
+    names = set()
+    for path in sorted(root.rglob("SKILL.md")):
+        path = path.resolve()
+        if not path.is_relative_to(root):
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8-sig").splitlines()
+            if not lines or lines[0].strip() != "---":
+                raise ValueError("缺少 YAML 元数据")
+
+            end = next(
+                i for i in range(1, len(lines))
+                if lines[i].strip() == "---"
+            )
+            metadata = yaml.safe_load("\n".join(lines[1:end]))
+            if not isinstance(metadata, dict):
+                raise ValueError("元数据必须是字典")
+            name = metadata.get("name")
+            description = metadata.get("description")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("name 必须是非空字符串")
+            if not isinstance(description, str) or not description.strip():
+                raise ValueError("description 必须是非空字符串")
+            if name in names:
+                raise ValueError(f"技能名称重复：{name}")
+            names.add(name)
+            descriptions.append(
+                f"名称：{name}\n"
+                f"用途：{description}\n"
+                f"文件：{path}"
+            )
+        except (
+            OSError, UnicodeError, ValueError,
+            StopIteration, yaml.YAMLError,
+        ) as error:
+            agent_print(f"跳过无效技能 {path}：{error}", mode=2)
+    if not descriptions:
+        return "\n当前没有可用技能。\n"
+    return "\n可用技能目录：\n\n" + "\n\n".join(descriptions) + "\n"
 
 # print(load_agents_md())
 # print(load_environments())

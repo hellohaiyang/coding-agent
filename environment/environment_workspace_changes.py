@@ -25,7 +25,7 @@ def build_manifest(workspace):
     for path in workspace.rglob("*"):
         relative_path = path.relative_to(workspace)
         relative_text = relative_path.as_posix()
-        if ".git" in relative_path.parts:
+        if ".git" in relative_path.parts or relative_path.parts[0] == ".agent_tool_outputs":
             continue
         if relative_text in INTERNAL_FILES:
             continue
@@ -121,7 +121,8 @@ def apply_changes(source_workspace, agent_workspace):
     for relative_path in changed_paths:
         before = baseline.get(relative_path)
         after = agent_current.get(relative_path)
-        if (before is not None and before.get("type") == "symlink") or (after is not None and after.get("type") == "symlink"):
+        if (before is not None and before.get("type") == "symlink") or (
+                after is not None and after.get("type") == "symlink"):
             raise RuntimeError(
                 f"符号链接变化需要手动处理：{relative_path}"
             )

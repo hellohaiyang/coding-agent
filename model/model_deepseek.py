@@ -35,11 +35,11 @@ class ModelDeepSeek:
         )
         return response.choices[0].message, response.usage.total_tokens
 
-    def generate_usual(self, prompt):
+    def generate_usual(self, prompt, system_prompt):
         response = self.client.chat.completions.create(
             model="deepseek-v4-flash",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant"},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             stream=False,

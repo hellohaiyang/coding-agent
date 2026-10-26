@@ -18,10 +18,14 @@ class Config:
     tool_trim_size = 80000  # 比较长就进行工具压缩
     tool_max_output = 30000  # 工具的最大长度，超过就截断
     tool_max_attempts = 3  # 工具最大尝试次数
-    max_summary_chars=10000#限制摘要字数
+    max_summary_chars = 10000  # 限制摘要字数
     max_consecutive_tool_failures = 5  #
     max_model_format_retries = 2  #
-    skill_path = r"Agent/skills"  # skill的存放目录
+    # skill
+    # skill_path = r"Agent/skills"  # skill的存放目录
+    skills_enabled = True
+    skill_path = Path(__file__).resolve().parents[1] / "skills"
+    # memory
     max_size_long_term_memory = 5000  # 如果长期记忆太长，超过5000字就截断
     qwen_check_model_path = "/data/shenghaiyang/downloadmodel/qwen2coder/"  # 自动审批的小模型目录
 
@@ -29,6 +33,11 @@ class Config:
     run_workspace = (
             Path.home() / ".codeagent" / "runs"
     ).resolve()
+    memory_root = (run_workspace.parent / "memory").resolve()
+    embedding_model_path = os.getenv("EMBEDDING_MODEL_PATH", "")
+    memory_extract_every = 3
+    memory_idle_seconds = 300
+    memory_extract_chars = 16000
     # long_term_memory_path = Path(run_workspace) / "long_memory.md"  # 存长期记忆的文件
     run_id_interrupt_path = Path(run_workspace) / "run_id.txt"
     # history_path = Path(run_workspace) / "history_messages.json"  # 存所有对话历史的文件，防止压缩丢信息
@@ -40,6 +49,19 @@ class Config:
     sandbox_max_timeout = 300
     #
     user_long_term_memory = Path(run_workspace) / "user_long_memory.md"
+
+    # mcp
+    mcp_enabled = True
+    mcp_url = "http://127.0.0.1:8000/mcp"
+    mcp_mode = "local"
+    # evolution
+    evolution_root = Path(__file__).resolve().parents[1] / "evolution"
+    evolution_enabled=True
+    evolution_trace_chars=16000
+    evolution_files_chars=40000
+    evolution_eval_repeats = 3
+    evolution_eval_timeout = 180
+    evolution_perf_tolerance = 0.0
 
     @classmethod
     def get_project_long_term_memory_path(cls, run_id):

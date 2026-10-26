@@ -1,37 +1,90 @@
 import asyncio
 import json
+import sys
 from uuid import uuid4
-
 from pathlib import Path
-
+from mcp import StdioServerParameters
 from openai import APITimeoutError
-
 from Agent.config.config import Config
+from Agent.context.context_compressor import compress_context
 from Agent.context.context_long_memory import LongMemory
 from Agent.context.manager_context import ManagerContext
 from Agent.environment.environment_workspace_changes import create_change_report, check_source_conflicts, apply_changes
 from Agent.environment.environment_workspace_copy import create_work_space_copy
 from Agent.environment.manager_environment import ManagerEnvironment
+from Agent.evolution.loader import load_run_version
+from Agent.evolution.manager_evolution import ManagerEvolution
+from Agent.mcpserver.manager_mcp import connect_mcp
 from Agent.model.manger_model import ManagerModel
 from Agent.recovery.manager_recovery import ManagerRecovery
 from Agent.recovery.recovery_state import AgentState, RunStatus, RunPhase, ToolCallState, ToolStatus
+from Agent.tools.manager_tool import TOOLS_SCHEMA
+from Agent.tools.tool_mcp import MCPTools
 from Agent.utils import agent_print, valid_llm_response, dump_llm_response, ModelOutputFormatError
+from datetime import timedelta
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+from mcp.client.stdio import stdio_client
+from Agent.evolution.loader import load_run_version, prepare_run_memory
+from Agent.context.context_build_system_prompt import build_system_prompt
+from Agent.evolution.prompts import PromptStore
 
 
 class Agent:
-    def __init__(self, task=None, run_id=None, recovery=False, agent_workspace=None):
+    def __init__(self, task=None, run_id=None, recovery=False, agent_workspace=None, evolution_version=None,enable_evolution=True):
+        self.enable_evolution = enable_evolution
         self.agent_workspace = Path(agent_workspace)
-        self.manager_model = ManagerModel(Config.model_name)
-        self.manager_environment = ManagerEnvironment(run_id=run_id, agent_workspace=self.agent_workspace)
-        self.manager_recovery = ManagerRecovery(agent_workspace=self.agent_workspace)
-        self.long_memory = LongMemory(run_id)
+        self.evolution = load_run_version(
+            self.agent_workspace,
+            recovery=recovery,
+            version=evolution_version,
+        )
+        self.prompts = PromptStore(self.evolution.prompt_path)
+        self.system_prompt = build_system_prompt(
+            self.evolution,
+            self.prompts,
+        )
+        self.memory_root = prepare_run_memory(
+            self.evolution,
+            self.agent_workspace,
+            recovery=recovery,
+        )
+        self.manager_model = ManagerModel(Config.model_name, prompts=self.prompts, )
+        self.manager_environment = ManagerEnvironment(
+            run_id=run_id,
+            agent_workspace=self.agent_workspace,
+            system_prompt=self.system_prompt,
+            skill_path=self.evolution.skills_path,
+        )
+        self.manager_recovery = ManagerRecovery(
+            agent_workspace=self.agent_workspace,
+        )
+        self.long_memory = LongMemory(
+            run_id=run_id,
+            memory_root=self.memory_root,
+            prompts=self.prompts,
+        )
+        self.manager_environment.manager_tool.tools.update({
+            "readmemory": self.long_memory.readmemory,
+            "writememory": self.long_memory.writememory,
+            "editmemory": self.long_memory.editmemory,
+            "search": self.long_memory.search,
+        })
+        self.context_handler = compress_context
         if recovery:
             # 恢复任务
             state = self.manager_recovery.load_state(run_id)
             if state is None:
                 raise ValueError(f"任务不存在：{run_id}")
             self.agent_state = state
-            self.manager_context = ManagerContext(state.task, agent_workspace=self.agent_workspace, run_id=run_id)
+            self.manager_context = ManagerContext(
+                state.task,
+                agent_workspace=self.agent_workspace,
+                run_id=run_id,
+                system_prompt=self.system_prompt,
+                memory_root=self.memory_root,
+                prompts=self.prompts,
+            )
             context = self.manager_recovery.load_context(run_id)
             if context:
                 self.manager_context.compression = context["compression"]
@@ -42,7 +95,14 @@ class Agent:
             if not task:
                 raise ValueError(f"新任务必须提供task")
             self.agent_state = AgentState(run_id=run_id, task=task)
-            self.manager_context = ManagerContext(task, agent_workspace=self.agent_workspace, run_id=run_id)
+            self.manager_context = ManagerContext(
+                task,
+                agent_workspace=self.agent_workspace,
+                run_id=run_id,
+                system_prompt=self.system_prompt,
+                memory_root=self.memory_root,
+                prompts=self.prompts,
+            )
             self.save_step()
 
     async def recovery(self):
@@ -122,7 +182,7 @@ class Agent:
             tool_state.arguments_json,
         )
         used_attempts = 0
-        for existing_state in self.manager_recovery.load_recent_tool_calls(tool_state.run_id):
+        for existing_state in self.get_current_turn_tool_calls():
             existing_signature = self.get_tool_signature(existing_state.tool_name, existing_state.arguments_json)
             if existing_signature == target_signature:
                 used_attempts += existing_state.attempt
@@ -159,6 +219,13 @@ class Agent:
             function_name = tool_state.tool_name
             arguments = json.loads(tool_state.arguments_json)
             result = await  self.manager_environment.run_tool(function_name, arguments)
+            if function_name in {
+                "run_subagent",
+                "run_parallel_agents",
+                "run_agent_team",
+            } and result["success"]:
+                self.agent_state.used_tokens += result["output"]["used_tokens"]
+                self.save_step()
             # save
             tool_state.result_json = json.dumps(result, ensure_ascii=False, default=str)
             if result["success"]:
@@ -192,8 +259,16 @@ class Agent:
         max_attempts = Config.max_model_format_retries + 1
         last_error = None
         for attempt_number in range(1, max_attempts + 1):
+            # mcp
+            manager_tool = self.manager_environment.manager_tool
+            tools = list(TOOLS_SCHEMA)
+            if manager_tool.mcp is not None:
+                tools.extend(manager_tool.mcp.schemas)
             llm_response, used_token = await asyncio.to_thread(self.manager_model.generate_flash_use_tool,
-                                                               retry_messages)
+                                                               retry_messages, tools=tools)
+            # mcp end
+            # llm_response, used_token = await asyncio.to_thread(self.manager_model.generate_flash_use_tool,
+            #                                                    retry_messages)
             state.used_tokens += used_token or 0
             self.save_step()
             try:
@@ -212,15 +287,11 @@ class Agent:
                 if attempt_number >= max_attempts:
                     break
                 raw_output = dump_llm_response(llm_response)
-                repair_prompt = (
-                    "上一条模型响应格式无效，请重新生成。\n"
-                    f"错误类型：{error.code}\n"
-                    f"错误详情：{error}\n"
-                    "不要解释错误，也不要使用 Markdown 代码块。\n"
-                    "如果需要调用工具，请生成符合工具 Schema 的工具调用。\n"
-                    "如果不需要调用工具，请返回非空的最终答案。\n"
-                    "上一条无效输出如下：\n"
-                    f"{raw_output}"
+                repair_prompt = self.prompts.render(
+                    "repair",
+                    error_code=error.code,
+                    error=str(error),
+                    raw_output=raw_output,
                 )
                 retry_messages = [
                     *messages,
@@ -241,11 +312,31 @@ class Agent:
         agent_print(f"第{self.agent_state.step}轮次开始\n", 2)
         state = self.agent_state
         # 先压缩上下文
-        compressed_token = await asyncio.to_thread(self.manager_context.run_compression)
-        if compressed_token != -1:
-            state.used_tokens += compressed_token
-            self.manager_recovery.save_context(state.run_id, self.manager_context.compression,
-                                               self.manager_context.recent_messages)
+        # compressed_token = await asyncio.to_thread(self.manager_context.run_compression)
+        # if compressed_token != -1:
+        #     state.used_tokens += compressed_token
+        #     self.manager_recovery.save_context(state.run_id, self.manager_context.compression,
+        #                                        self.manager_context.recent_messages)
+        compress_status = "success"
+        if self.context_handler is not None:
+            compress_status, used_tokens = await asyncio.to_thread(
+                self.context_handler, self.manager_context
+            )
+            state.used_tokens += used_tokens
+            self.manager_recovery.save_context(
+                state.run_id,
+                self.manager_context.compression,
+                self.manager_context.recent_messages
+            )
+        if (compress_status != "success" or self.manager_context.get_context_size() >= Config.max_content_token):
+            state.status = RunStatus.INTERRUPTED
+            state.phase = RunPhase.READY_FOR_LLM
+            state.error = "上下文压缩后仍然超限，已暂停本轮任务。"
+            self.save_step()
+            return {
+                "status": "blocked",
+                "content": state.error,
+            }
         messages = self.manager_context.build_context()
         state.phase = RunPhase.LLM_INFLIGHT
         self.save_step()
@@ -311,7 +402,9 @@ class Agent:
                     self.manager_context.recent_messages,
                 )
             # check fail
-            if self.manager_recovery.has_consecutive_tool_failures(state.run_id, Config.max_consecutive_tool_failures):
+            limit = Config.max_consecutive_tool_failures
+            recent_calls = self.get_current_turn_tool_calls(limit)
+            if len(recent_calls) == limit and all(call.status == ToolStatus.FAILED for call in recent_calls):
                 state.status = RunStatus.INTERRUPTED
                 state.phase = RunPhase.READY_FOR_LLM
                 state.error = (
@@ -328,14 +421,14 @@ class Agent:
             state.phase = RunPhase.READY_FOR_LLM
             self.save_step()
             # 提取长期记忆
-            if (state.step) % 8 == 0:
-                try:
-                    used_token = await asyncio.to_thread(self.long_memory.extract_long_memory,
-                                                         self.manager_context.recent_messages)
-                    state.used_tokens += used_token
-                except Exception as e:
-                    agent_print(f"长期记忆提取失败：{e}", mode=2)
-                self.save_step()
+            # if (state.step) % 8 == 0:
+            #     try:
+            #         used_token = await asyncio.to_thread(self.long_memory.extract_long_memory,
+            #                                              self.manager_context.recent_messages)
+            #         state.used_tokens += used_token
+            #     except Exception as e:
+            #         agent_print(f"长期记忆提取失败：{e}", mode=2)
+            #     self.save_step()
             return {
                 "status": "continue",
                 "content": results,
@@ -346,10 +439,10 @@ class Agent:
             state.status = RunStatus.SUCCEEDED
             state.error = None
             self.save_step()
-            used_token = await asyncio.to_thread(self.long_memory.extract_long_memory,
-                                                 self.manager_context.recent_messages)
-            state.used_tokens += used_token
-            self.save_step()
+            # used_token = await asyncio.to_thread(self.long_memory.extract_long_memory,
+            #                                      self.manager_context.recent_messages)
+            # state.used_tokens += used_token
+            # self.save_step()
             return {
                 "status": "success",
                 "content": llm_response.content,
@@ -415,7 +508,11 @@ class Agent:
                     "result": (f"工具执行失败{tool_state.error}")
                 }
             elif tool_state.status == ToolStatus.RUNNING:
-                if tool_state.tool_name == "read":
+                if tool_state.tool_name in {
+                    "read",
+                    "readmemory",
+                    "search",
+                }:
                     tool_state.status = ToolStatus.PENDING
                     self.manager_recovery.save_tool_call(tool_state)
                     result_item = await self.execute_tool_call(tool_state)
@@ -514,6 +611,143 @@ class Agent:
         self.save_step()
         return final_answer
 
+    async def ask(self, task):
+        task = task.strip()
+        if not task:
+            raise ValueError("用户输入不能为空")
+        state = self.agent_state
+        if state.status not in {RunStatus.CREATED, RunStatus.SUCCEEDED}:
+            raise RuntimeError("请先完成或恢复当前轮次")
+        state.task = task
+        state.status = RunStatus.CREATED
+        state.phase = RunPhase.READY_FOR_LLM
+        state.step = 0
+        state.final_answer = None
+        state.error = None
+        self.manager_context.task = task
+        message = {
+            "role": "user",
+            "content": task,
+        }
+        self.manager_context.recent_messages.append(message)
+        seq = self.manager_recovery.get_next_message_seq(state.run_id)
+        self.manager_recovery.save_message(state.run_id, seq, message)
+        self.manager_recovery.save_context(
+            state.run_id,
+            self.manager_context.compression,
+            self.manager_context.recent_messages
+        )
+        self.save_step()
+        return await self.run()
+
+    async def _run_memory_job(self, handler, *args):
+        try:
+            result = await asyncio.to_thread(
+                handler, *args
+            )
+            used_tokens = result["used_tokens"]
+            if used_tokens:
+                self.agent_state.used_tokens += used_tokens
+                self.save_step()
+            if result["error"]:
+                agent_print(
+                    f'记忆处理失败：{result["error"]}',
+                    mode=2,
+                )
+        except Exception as error:
+            agent_print(
+                f"记忆处理失败：{error}",
+                mode=2,
+            )
+
+    async def _after_task(self):
+        if self.agent_state.status != RunStatus.SUCCEEDED:
+            return
+        await self._run_memory_job(
+            self.long_memory.on_turn_completed,
+            self.agent_workspace.parent / "agent_state.db",
+        )
+        if not Config.evolution_enabled or not self.enable_evolution:
+            return
+        try:
+            report = await ManagerEvolution(self).run()
+            if report is not None:
+                activation = report.get("activation", {})
+                agent_print(
+                    f"进化处理：{report['status']}，"
+                    f"候选版本：{report.get('candidate', '无')}，"
+                    f"版本切换：{activation.get('status', '未执行')}，"
+                    f"说明：{activation.get('error') or activation.get('reason', '')}",
+                    mode=2,
+                )
+        except Exception as error:
+            agent_print(f"进化处理失败：{error}", mode=2)
+
+    async def _wait_task(self):
+        input_task = asyncio.create_task(
+            asyncio.to_thread(input, "\n任务：")
+        )
+        while True:
+            done, _ = await asyncio.wait(
+                {input_task},
+                timeout=max(
+                    1, Config.memory_idle_seconds
+                ),
+            )
+            if done:
+                return input_task.result().strip()
+            await self._run_memory_job(
+                self.long_memory.dream_pending
+            )
+
+    async def chat(self, recovery=False):
+        result = (
+            await self.recovery()
+            if recovery
+            else await self.ask(self.agent_state.task)
+        )
+        await self._after_task()
+        while self.agent_state.status == RunStatus.SUCCEEDED:
+            try:
+                task = await self._wait_task()
+            except EOFError:
+                break
+            if task == "exit":
+                break
+            if not task:
+                continue
+            result = await self.ask(task)
+            await self._after_task()
+        return result
+
+    def get_current_turn_tool_calls(self, limit=5):
+        tool_ids = set()
+        messages = self.manager_recovery.load_messages(
+            self.agent_state.run_id
+        )
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                break
+            for call in message.get("tool_calls", []):
+                tool_ids.add(call["id"])
+        return [
+            call
+            for call in self.manager_recovery.load_recent_tool_calls(
+                self.agent_state.run_id,
+                limit=limit,
+            )
+            if call.tool_call_id in tool_ids
+        ]
+
+
+async def run_agent(agent, recovery=False):
+    async with connect_mcp(
+        agent.manager_environment.manager_tool,
+        agent.evolution,
+        agent.agent_workspace,
+    ):
+        return await agent.chat(recovery=recovery)
+
 
 async def main():
     task = input("输入任务：")
@@ -523,7 +757,9 @@ async def main():
     # 启动任务
     agent = Agent(task=task, run_id=run_id, agent_workspace=agent_workspace)
     try:
-        await agent.run()
+        # mcp
+        await run_agent(agent)
+        # await agent.run()
         await asyncio.to_thread(agent.manager_environment.sandbox.stop)
         report, report_path = create_change_report(agent_workspace)
         print(f"新增文件：{report['added']}")
@@ -576,7 +812,8 @@ async def recovery_main(run_id):
         )
     agent = Agent(run_id=run_id, recovery=True, agent_workspace=agent_workspace)
     try:
-        await agent.recovery()
+        # await agent.recovery()
+        await run_agent(agent, recovery=True)
         await asyncio.to_thread(agent.manager_environment.sandbox.stop)
         report, report_path = create_change_report(agent_workspace)
         print(f"新增文件：{report['added']}")
@@ -605,7 +842,6 @@ async def recovery_main(run_id):
                 )
             else:
                 print("未应用变更，运行副本仍然保留")
-
     finally:
         try:
             await asyncio.to_thread(
